@@ -1,6 +1,6 @@
 discord.py
 requests
 python-dotenv
-google-genai
+google.generativeai
 pymongo[srv]
 certifi
