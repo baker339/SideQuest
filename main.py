@@ -4,22 +4,31 @@ import json
 import requests
 import datetime
 import asyncio
+import google.generativeai as genai
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-# --- CONFIG ---
+# --- 1. CONFIGURATION ---
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 WEATHER_KEY = os.getenv('WEATHER_KEY')
+GEMINI_KEY = os.getenv('GEMINI_KEY')
+
+# Configure Gemini
+genai.configure(api_key=GEMINI_KEY)
+ai_model = genai.GenerativeModel('gemini-1.5-flash')
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "data.json"
+# Path for Railway Persistent Volume
+DATA_FILE = "/app/data/data.json" 
+# If testing locally, you can change this to "data.json"
 
-
-# --- DATA HELPERS ---
+# --- 2. DATA HELPERS ---
 def load_data():
+    if not os.path.exists("/app/data"):
+        os.makedirs("/app/data", exist_ok=True)
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r") as f:
@@ -28,67 +37,65 @@ def load_data():
             return {}
     return {}
 
-
 def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-
-# --- QUEST LOGIC ---
-def get_weather_and_city(location):
-    # If it's a 5-digit zip, force US to avoid international confusion
+# --- 3. AI & WEATHER ENGINES ---
+def get_weather(location):
     query = f"{location},US" if (location.isdigit() and len(location) == 5) else location
     url = f"http://api.openweathermap.org/data/2.5/weather?q={query}&appid={WEATHER_KEY}&units=imperial"
-    resp = requests.get(url).json()
-    return resp
+    return requests.get(url).json()
 
+async def generate_ai_quest(city, weather_resp, interests, level):
+    weather_desc = weather_resp['weather'][0]['description']
+    temp = weather_resp['main']['temp']
+    
+    prompt = f"""
+    Role: Dungeon Master for a real-life RPG 'Side Quest'.
+    User Context: Location: {city}, Weather: {weather_desc} at {temp}F, Interests: {interests}, Player Level: {level}.
+    Task: Generate a unique real-world mission.
+    Rules: 
+    1. Must be safe, legal, and doable in 15-30 mins.
+    2. Must require taking a photo as proof.
+    3. Match the mission to their interests.
+    Format:
+    Quest Name: [Title]
+    Mission: [1-2 sentences of instructions]
+    """
+    try:
+        response = ai_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return "Quest Name: Local Explorer\nMission: Head to the nearest public park and find a unique landmark. Take a photo of it!"
 
-def generate_quest_text(resp, interests):
-    weather = resp["weather"][0]["main"]
-    temp = resp["main"]["temp"]
-    city = resp["name"]
-
-    # Simple Interest Matching
-    interest_list = [i.strip().lower() for i in interests.split(",")]
-
-    if "Rain" in weather or "Snow" in weather:
-        return f"It's rainy in {city}. 🌧️ Side Quest: Find a local indoor spot (library or cafe) and spend 15 minutes learning about {interest_list[0]}."
-    elif temp > 80:
-        return f"Hot day in {city} ({temp}°F)! ☀️ Side Quest: Find a local shop that sells cold treats and try their most unique flavor."
-    else:
-        return f"Beautiful day in {city}! 🧭 Side Quest: Head toward the nearest park. Find something that relates to {interest_list[0]} and take a photo of it!"
-
-
-# --- COMMANDS ---
+# --- 4. COMMANDS ---
 
 @bot.command()
 async def register(ctx):
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel
-
+    def check(m): return m.author == ctx.author and m.channel == ctx.channel
+    
     await ctx.send(f"👋 **Guild Registration for {ctx.author.name} is starting!**")
     await ctx.send("📍 What is your **City, State** (e.g. San Diego, CA) or **Zip Code**?")
-
+    
     try:
         msg = await bot.wait_for('message', check=check, timeout=60.0)
         loc_input = msg.content
-        resp = get_weather_and_city(loc_input)
-
+        resp = get_weather(loc_input)
+        
         if resp.get("cod") != 200:
-            return await ctx.send("❌ Location not found. Try `!register` again with 'City, State' or Zip.")
-
+            return await ctx.send("❌ Location not found. Try `!register` again with a valid city/zip.")
+        
         city_name = resp.get("name")
         tz_offset = resp.get("timezone", 0)
-    except asyncio.TimeoutError:
-        return await ctx.send("⏳ Timed out.")
+    except asyncio.TimeoutError: return await ctx.send("⏳ Timed out.")
 
-    await ctx.send(
-        f"🗺️ Confirmed: **{city_name}**. Now, what are your **Interests**? (List them like: Art, Coffee, History)")
+    await ctx.send(f"🗺️ Confirmed: **{city_name}**. Now, what are your **Interests**?")
     try:
         msg = await bot.wait_for('message', check=check, timeout=60.0)
         ints = msg.content
-    except asyncio.TimeoutError:
-        return await ctx.send("⏳ Timed out.")
+    except asyncio.TimeoutError: return await ctx.send("⏳ Timed out.")
 
     users = load_data()
     users[str(ctx.author.id)] = {
@@ -103,76 +110,67 @@ async def register(ctx):
         "last_quest_date": ""
     }
     save_data(users)
-    await ctx.send(f"✅ **Success!** You are registered in {city_name}. Type `!quest` to get your first mission.")
-
+    await ctx.send(f"✅ **Registered!** Type `!quest` to begin your journey.")
 
 @bot.command()
 async def quest(ctx):
     users = load_data()
     uid = str(ctx.author.id)
-    if uid not in users:
-        return await ctx.send("Register first with `!register`.")
-
+    if uid not in users: return await ctx.send("Use `!register` first!")
+    
     user = users[uid]
     today = datetime.date.today().isoformat()
 
     if user["active_quest"]:
-        embed = discord.Embed(title="⚔️ QUEST ALREADY ACTIVE", description=user["active_quest"], color=0xffa500)
-        embed.set_footer(text="Complete it with !complete (attach a photo) or !abandon it.")
+        embed = discord.Embed(title="⚔️ ACTIVE QUEST", description=user["active_quest"], color=0xffa500)
         return await ctx.send(embed=embed)
 
     if user["last_quest_date"] == today:
-        return await ctx.send("⌛ You've already received a quest today! Come back tomorrow for a new one.")
+        return await ctx.send("⌛ You've already had a quest today! Come back tomorrow.")
 
-    resp = get_weather_and_city(user["location"])
-    new_q = generate_quest_text(resp, user["interests"])
-
+    await ctx.send("✨ *Consulting the Guild Oracle for a custom quest...*")
+    resp = get_weather(user["location"])
+    new_q = await generate_ai_quest(user['city'], resp, user['interests'], user['level'])
+    
     users[uid]["active_quest"] = new_q
     users[uid]["last_quest_date"] = today
     save_data(users)
-
-    await ctx.send(embed=discord.Embed(title="📜 NEW SIDE QUEST", description=new_q, color=0x3498db))
-
+    
+    await ctx.send(embed=discord.Embed(title="📜 YOUR SIDE QUEST", description=new_q, color=0x3498db))
 
 @bot.command()
 async def complete(ctx):
     users = load_data()
     uid = str(ctx.author.id)
     if uid not in users or not users[uid]["active_quest"]:
-        return await ctx.send("You don't have an active quest to complete!")
+        return await ctx.send("You don't have an active quest!")
 
     if not ctx.message.attachments:
-        return await ctx.send("❌ **Evidence Required!** You must attach a photo of your completed quest to earn XP.")
+        return await ctx.send("❌ **Proof Required!** Attach a photo to complete the quest.")
 
     users[uid]["xp"] += 50
-    users[uid].update({"active_quest": None})
-
-    # Level Up Logic
+    users[uid]["active_quest"] = None
+    
     new_level = (users[uid]["xp"] // 100) + 1
     leveled_up = new_level > users[uid]["level"]
     users[uid]["level"] = new_level
-
+    
     save_data(users)
-
-    msg = f"🌟 **Quest Completed!** {ctx.author.name} earned 50 XP."
-    if leveled_up:
-        msg += f"\n🎊 **LEVEL UP!** You reached Level {new_level}!"
+    msg = f"🌟 **Quest Completed!** +50 XP."
+    if leveled_up: msg += f"\n🎊 **LEVEL UP!** You are now Level {new_level}!"
     await ctx.send(msg)
-
 
 @bot.command()
 async def profile(ctx):
     users = load_data()
     u = users.get(str(ctx.author.id))
-    if not u: return await ctx.send("No profile found. Use `!register`.")
-
+    if not u: return await ctx.send("Register first!")
+    
     embed = discord.Embed(title=f"🛡️ {u['name']}'s Stats", color=0x9b59b6)
     embed.add_field(name="Level", value=u["level"], inline=True)
-    embed.add_field(name="XP", value=f"{u['xp']}/{(u['level']) * 100}", inline=True)
-    embed.add_field(name="Location", value=u["city"], inline=False)
-    embed.add_field(name="Current Quest", value=u["active_quest"] or "None", inline=False)
+    embed.add_field(name="XP", value=f"{u['xp']}/{u['level']*100}", inline=True)
+    embed.add_field(name="Active Quest", value="Yes" if u["active_quest"] else "None", inline=False)
     await ctx.send(embed=embed)
-
 
 @bot.command()
 async def abandon(ctx):
@@ -181,26 +179,16 @@ async def abandon(ctx):
     if uid in users and users[uid]["active_quest"]:
         users[uid]["active_quest"] = None
         save_data(users)
-        await ctx.send("🏳️ Quest abandoned. You can request a new one tomorrow.")
-    else:
-        await ctx.send("You don't have an active quest.")
+        await ctx.send("🏳️ Quest abandoned. See you tomorrow.")
 
-
-# --- HELP ---
+# --- 5. HELP & SCHEDULER ---
 bot.remove_command('help')
-
-
 @bot.command()
 async def help(ctx):
-    embed = discord.Embed(title="⚔️ SIDE QUEST: HOW TO PLAY", color=0x3498db)
-    embed.add_field(name="Commands",
-                    value="`!register` - Set up profile\n`!quest` - Get daily mission\n`!complete` - Submit photo proof\n`!profile` - Check stats\n`!abandon` - Drop current quest",
-                    inline=False)
-    embed.set_footer(text="Quests refresh at 9:00 AM local time.")
+    embed = discord.Embed(title="⚔️ HOW TO PLAY", color=0x3498db)
+    embed.description = "`!register` - Start here\n`!quest` - Get mission\n`!complete` - Submit with photo\n`!profile` - Stats\n`!abandon` - Drop quest"
     await ctx.send(embed=embed)
 
-
-# --- SCHEDULER ---
 @tasks.loop(minutes=30)
 async def daily_trigger():
     users = load_data()
@@ -208,33 +196,26 @@ async def daily_trigger():
     today = datetime.date.today().isoformat()
 
     for uid, info in users.items():
-        # SAFETY GUARD: Skip if the data is incomplete
-        if 'tz_offset' not in info:
-            continue
-
+        if 'tz_offset' not in info: continue
         user_hour = (now_utc + datetime.timedelta(seconds=info['tz_offset'])).hour
-
+        
         if user_hour == 9:
             try:
                 user_obj = await bot.fetch_user(int(uid))
                 if info["active_quest"]:
-                    await user_obj.send(f"🔔 **Reminder:** You have an open quest: {info['active_quest']}")
+                    await user_obj.send(f"🔔 **Reminder:** Finish your quest!\n{info['active_quest']}")
                 elif info["last_quest_date"] != today:
-                    resp = get_weather_and_city(info["location"])
-                    new_q = generate_quest_text(resp, info["interests"])
+                    resp = get_weather(info["location"])
+                    new_q = await generate_ai_quest(info['city'], resp, info['interests'], info['level'])
                     users[uid]["active_quest"] = new_q
                     users[uid]["last_quest_date"] = today
                     save_data(users)
-                    await user_obj.send(f"☀️ **Morning!** Your new quest: {new_q}")
-            except:
-                pass
-
+                    await user_obj.send(f"☀️ **New Quest:**\n{new_q}")
+            except: pass
 
 @bot.event
 async def on_ready():
-    print(f"Side Quest Bot Online.")
-    if not daily_trigger.is_running():
-        daily_trigger.start()
-
+    print("Side Quest Bot Online.")
+    if not daily_trigger.is_running(): daily_trigger.start()
 
 bot.run(TOKEN)
